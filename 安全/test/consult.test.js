@@ -1,0 +1,52 @@
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+const crypto=require('node:crypto');
+const {createServer}=require('../server');
+
+test('问诊需普通用户登录，消息按账号隔离，支持 AI 回复与清空',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ankang-consult-'));
+ t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const users=['alice','bob','admin'].map(account=>{const salt=crypto.randomBytes(16).toString('hex');return{id:account,account,name:account,role:account==='admin'?'健康安全管理员':'普通用户',salt,passwordHash:crypto.scryptSync('Test123456',salt,64).toString('hex')}});
+ const usersFile=path.join(dir,'users.json'),consultDir=path.join(dir,'consult');fs.writeFileSync(usersFile,JSON.stringify(users));
+ const prompts=[];
+ const server=createServer({usersFile,consultDir,aiEnv:{HEALTH_AI_API_KEY:'test-key',HEALTH_AI_MODEL:'test-model',HEALTH_AI_BASE_URL:'http://127.0.0.1:9999/v1'},aiFetch:async(url,options)=>{prompts.push({url:String(url),headers:options.headers,body:JSON.parse(options.body)});return{ok:true,json:async()=>({choices:[{message:{content:'建议记录症状，并咨询专业医生。'}}]})}}});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.close();server.closeAllConnections()});
+ const base='http://127.0.0.1:'+server.address().port;
+ const request=async(route,{method='GET',cookie,user,body,origin}={})=>{const res=await fetch(base+route,{method,headers:{...(cookie?{Cookie:cookie}:{}),...(user?{'X-Health-User':user}:{}),...(body?{'Content-Type':'application/json'}:{}),...(origin?{Origin:origin}:{})},...(body?{body:JSON.stringify(body)}:{})});return{status:res.status,data:await res.json(),cookie:res.headers.get('set-cookie')?.split(';')[0]}};
+ const login=async(account,mode='user')=>(await request('/api/login',{method:'POST',body:{account,password:'Test123456',mode}})).cookie;
+ const alice=await login('alice'),bob=await login('bob'),admin=await login('admin','admin');
+ assert.equal((await request('/api/consult')).status,401);
+ assert.equal((await request('/api/consult',{cookie:admin,user:'admin'})).status,403);
+ assert.equal((await request('/api/consult',{cookie:alice,user:'bob'})).status,409);
+ assert.equal((await request('/api/consult',{cookie:alice,user:'alice',method:'POST',body:{message:''}})).status,400);
+ assert.equal((await request('/api/consult',{cookie:alice,user:'alice',method:'POST',body:{message:'x'.repeat(1501)}})).status,400);
+ assert.equal((await request('/api/consult',{cookie:alice,user:'alice',method:'POST',body:{message:'你好'},origin:'https://elsewhere.example'})).status,403);
+ const answer=await request('/api/consult',{cookie:alice,user:'alice',method:'POST',body:{message:'最近睡不好，想了解注意事项'}});
+ assert.equal(answer.status,200);assert.equal(answer.data.messages.length,2);assert.match(answer.data.messages[1].content,/不能替代医生/);
+ assert.equal(prompts.length,1);assert.equal(prompts[0].url,'http://127.0.0.1:9999/v1/chat/completions');assert.equal(prompts[0].body.model,'test-model');
+ assert.equal((await request('/api/consult',{cookie:bob,user:'bob'})).data.messages.length,0);
+ assert.equal((await request('/api/consult',{cookie:alice,user:'alice'})).data.messages.length,2);
+ const urgent=await request('/api/consult',{cookie:alice,user:'alice',method:'POST',body:{message:'突然胸痛，呼吸困难'}});
+ assert.equal(urgent.status,200);assert.equal(urgent.data.urgent,true);assert.match(urgent.data.messages.at(-1).content,/急救/);assert.equal(prompts.length,1);
+ assert.equal((await request('/api/consult/clear',{cookie:alice,user:'alice',method:'DELETE',origin:'https://elsewhere.example'})).status,403);
+ assert.equal((await request('/api/consult/clear',{cookie:alice,user:'bob',method:'DELETE'})).status,409);
+ assert.equal((await request('/api/consult/clear',{cookie:alice,user:'alice',method:'DELETE'})).status,200);
+ assert.deepEqual((await request('/api/consult',{cookie:alice,user:'alice'})).data.messages,[]);
+ assert.deepEqual((await request('/api/consult',{cookie:bob,user:'bob'})).data.messages,[]);
+});
+
+test('未配置模型不会伪造普通回复，急症提醒仍可用',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'ankang-consult-off-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const salt=crypto.randomBytes(16).toString('hex');fs.writeFileSync(path.join(dir,'users.json'),JSON.stringify([{id:'member',account:'member',name:'member',role:'普通用户',salt,passwordHash:crypto.scryptSync('Test123456',salt,64).toString('hex')}]));
+ const server=createServer({usersFile:path.join(dir,'users.json'),consultDir:path.join(dir,'consult'),aiEnv:{}});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>{server.close();server.closeAllConnections()});
+ const base='http://127.0.0.1:'+server.address().port;
+ const status=await(await fetch(base+'/api/consult/status')).json();assert.equal(status.available,false);
+ const login=await fetch(base+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account:'member',password:'Test123456'})});const cookie=login.headers.get('set-cookie').split(';')[0];
+ const post=message=>fetch(base+'/api/consult',{method:'POST',headers:{Cookie:cookie,'X-Health-User':'member','Content-Type':'application/json'},body:JSON.stringify({message})});
+ const missing=await post('普通健康问题');assert.equal(missing.status,503);assert.match((await missing.json()).message,/未配置/);
+ const urgent=await post('我突然呼吸困难');assert.equal(urgent.status,200);assert.equal((await urgent.json()).urgent,true);
+ const saved=await(await fetch(base+'/api/consult',{headers:{Cookie:cookie,'X-Health-User':'member'}})).json();assert.equal(saved.messages.length,2);
+});

@@ -1,0 +1,19 @@
+# Never commit credentials, medical records, chat history or databases.
+**/node_modules/
+**/data/
+**/.env
+**/.env.*
+!**/.env.example
+**/*.local
+**/*.log
+**/*.db
+**/*.sqlite*
+**/*.sql
+**/*.pem
+**/*.key
+**/*.p12
+**/app-config.json
+**/users.json
+mysql-local/
+.DS_Store
+Thumbs.db
