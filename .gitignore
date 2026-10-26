@@ -15,5 +15,6 @@
 **/app-config.json
 **/users.json
 mysql-local/
+.idea/
 .DS_Store
 Thumbs.db
